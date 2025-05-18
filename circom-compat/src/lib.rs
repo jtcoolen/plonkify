@@ -8,9 +8,7 @@ use std::io::{BufRead, Error, ErrorKind};
 use ark_serialize::{SerializationError, SerializationError::IoError};
 use ark_std::io::{Read, Seek, SeekFrom};
 
-use ark_relations::r1cs::{
-    ConstraintSystemRef, LinearCombination, SynthesisError, Variable,
-};
+use ark_relations::r1cs::{ConstraintSystemRef, LinearCombination, SynthesisError, Variable};
 
 use std::collections::HashMap;
 
@@ -232,15 +230,18 @@ fn read_map<R: Read>(mut reader: R, size: u64, header: &Header) -> IoResult<Vec<
 }
 
 pub fn read_witness<F: PrimeField>(reader: impl BufRead) -> Vec<F> {
-    reader.lines()
+    reader
+        .lines()
         .skip(1)
         .filter_map(|line| {
             let line = line.unwrap();
             if line.len() <= 1 {
-                return None
+                return None;
             }
-            Some(F::from_str(&line[2..line.len() - 1])
-                .unwrap_or_else(|_| panic!("Cannot parse witness line")))
+            Some(
+                F::from_str(&line[2..line.len() - 1])
+                    .unwrap_or_else(|_| panic!("Cannot parse witness line")),
+            )
         })
         .collect()
 }
@@ -255,15 +256,11 @@ impl<F: PrimeField> R1CSFile<F> {
         let offset_witness = cs.num_witness_variables();
 
         for i in 0..num_inputs {
-            cs.new_input_variable(|| {
-                Ok(self.witness[i])
-            })?;
+            cs.new_input_variable(|| Ok(self.witness[i]))?;
         }
 
         for i in 0..num_aux {
-            cs.new_witness_variable(|| {
-                Ok(self.witness[i + num_inputs])
-            })?;
+            cs.new_witness_variable(|| Ok(self.witness[i + num_inputs]))?;
         }
 
         let make_index = |index| {
@@ -291,7 +288,6 @@ impl<F: PrimeField> R1CSFile<F> {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

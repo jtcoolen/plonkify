@@ -1,8 +1,8 @@
-mod circuit;
-mod custom_gate;
+pub mod circuit;
+pub mod custom_gate;
 pub use custom_gate::CustomizedGates;
-mod plonkify;
-mod selectors;
 pub mod general;
+mod plonkify;
+pub mod selectors;
 pub mod vanilla;
-pub use plonkify::{Plonkifier, GeneralPlonkifer};
+pub use plonkify::{GeneralPlonkifer, Plonkifier};

@@ -35,10 +35,18 @@ pub struct PlonkishCircuitParams {
 ///   - the selector vectors
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlonkishCircuit<F: PrimeField> {
-    pub params: PlonkishCircuitParams,
+    // HyperPlonkIndex struct in Hyperplonk repository
+    pub params: PlonkishCircuitParams, // called HyperPlonkParams in Hyperplonk repository
     pub permutation: Vec<F>,
     pub selectors: Vec<SelectorColumn<F>>,
 }
+
+// HyperPlonk circuit is
+// pub struct MockCircuit<F: PrimeField> {
+//     pub public_inputs: Vec<F>,
+//     pub witnesses: Vec<WitnessColumn<F>>,
+//     pub index: HyperPlonkIndex<F>,
+// }
 
 impl<F: PrimeField> PlonkishCircuit<F> {
     fn witness_row(&self, values: &[F], idx: usize) -> Vec<F> {
