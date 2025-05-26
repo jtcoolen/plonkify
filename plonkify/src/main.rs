@@ -1,8 +1,9 @@
 use ark_bn254::Fr;
+use ark_ff::{BigInteger, Field};
 use circom_compat::{read_witness, R1CSFile};
 use clap::Parser;
 use core::num;
-use hyperplonk::witness;
+use hyperplonk::{prelude::SelectorColumn, witness};
 use plonkify::{
     general::{
         ExpandedCircuit, ExpansionConfig, LinearOnlyGeneralPlonkifier,
@@ -13,6 +14,7 @@ use plonkify::{
 };
 use std::io::BufReader;
 use std::{fs::File, time::Instant};
+use ark_ff::PrimeField;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -31,6 +33,129 @@ struct Cli {
     /// JSON witness file (e.g. witness.json)
     witness: String,
 }
+
+
+pub fn pad_permutation_field<F: PrimeField>(
+    mut permutation: Vec<F>,
+    num_rows: usize,
+    padding: usize,
+    expected_length: usize,
+) -> Vec<F> {
+    let mut new_permutation = permutation;
+    let mut current_offset = 0;
+
+    let mut chunk_start = 0;
+    while chunk_start + num_rows <= new_permutation.len() {
+        let insert_at = chunk_start + num_rows + current_offset;
+
+        // Insert padding block
+        for i in 0..padding {
+            new_permutation.insert(insert_at + i, F::zero()); // placeholder
+        }
+
+        // Shift all values >= insert_at by `padding`
+        for val in new_permutation.iter_mut() {
+            let v = val.into_bigint().as_ref()[0] as usize;
+            if v >= insert_at {
+                *val = F::from((v + padding) as u64);
+            }
+        }
+
+        // Fix the inserted padding block into a cycle
+        for i in 0..padding {
+            let idx = insert_at + i;
+            let next = insert_at + ((i + 1) % padding);
+            new_permutation[idx] = F::from(next as u64);
+        }
+
+        current_offset += padding;
+        chunk_start += num_rows;
+    }
+
+    // Final padding if needed
+    let final_pad_start = new_permutation.len();
+    while new_permutation.len() < expected_length {
+        new_permutation.push(F::zero());
+    }
+    let final_pad_indices: Vec<usize> = (final_pad_start..expected_length).collect();
+    for (i, &idx) in final_pad_indices.iter().enumerate() {
+        let next = final_pad_indices[(i + 1) % final_pad_indices.len()];
+        new_permutation[idx] = F::from(next as u64);
+    }
+
+    new_permutation
+}
+
+
+/// Checks that the permutation is a valid reordering of the witnesses with correct cycles.
+///
+/// A correct permutation must:
+/// - Be the same length as `witnesses`
+/// - Only include valid indices (i.e., < witnesses.len())
+/// - Consist of disjoint cycles that map every index in the witness array
+pub fn check_permutation<F: PrimeField>(
+    witnesses: &[F],
+    permutation: &[F],
+    num_rows: usize,
+) -> bool {
+    let len = witnesses.len();
+    if permutation.len() != len {
+        println!("Permutation length mismatch: expected {}, got {}", len, permutation.len());
+        return false;
+    
+    }
+
+    let zero = F::zero();
+    let zero_indices: Vec<usize> = permutation.iter()
+        .enumerate()
+        .filter_map(|(i, &val)| if val == zero { Some(i) } else { None })
+        .collect();
+
+    // Step 1: Check that all permutation values are valid indices
+    let mut seen = vec![false; len];
+    for &perm in permutation {
+        let idx = perm.into_bigint().as_ref()[0] as usize;
+        if idx >= len {
+            println!("Expected index < {}, got {}", len, idx);
+            return false;
+        }
+    }
+
+    // Step 2: Follow each unvisited cycle and mark entries
+    for start in 0..len {
+        if seen[start] {
+            continue;
+        }
+
+        let mut i = start;
+        let mut cycle_len = 0;
+        let next = 0;
+        loop {
+            if seen[i] {
+                // Cycle looped to an already seen value before completing — error
+                println!("cycle looped to an already seen value before completing, index {}, len {}, value {}", i, cycle_len, next);
+                //continue;
+                return false;
+            }
+            seen[i] = true;
+            let next = permutation[i].into_bigint().as_ref()[0] as usize;
+            cycle_len += 1;
+            if start == next {
+                break;
+            }
+            i = next;
+        }
+
+        if cycle_len == 0 {
+            println!("cycle of len 0");
+            return false;
+        }
+    }
+
+    // Step 3: All entries must be seen
+    seen.into_iter().all(|v| v)
+}
+
 
 fn convert_selectors(
     selectors: Vec<plonkify::selectors::SelectorColumn<Fr>>,
@@ -72,25 +197,64 @@ fn split_flat_witness<F: Clone + ark_std::Zero>(
     flat_witness: &[F],
     num_columns: usize,
     num_rows: usize,
+    num_pub_inputs: usize,
 ) -> Vec<Vec<F>> {
-    println!("num_columns: {}", num_columns);
-    println!("num_rows: {}", num_rows);
-    // Calculate the next power of two for num_rows
-    let padded_num_rows = num_rows.next_power_of_two();
-    println!("padded_num_rows: {}", padded_num_rows);
-    let mut columns = vec![Vec::with_capacity(num_rows); num_columns];
+    let padding = num_pub_inputs.next_power_of_two() - num_pub_inputs;
+    let padded_num_rows = (num_rows + padding).next_power_of_two();
 
-    for col in 0..num_columns {
-        for row in 0..num_rows {
-            columns[col].push(flat_witness[col * num_rows + row].clone());
+    let mut columns = vec![Vec::with_capacity(padded_num_rows); num_columns];
+
+    for wire in 0..num_columns {
+        // 1. Public inputs
+        for row in 0..num_pub_inputs {
+            columns[wire].push(flat_witness[wire * num_rows + row].clone());
         }
-        // Pad the column with zeros if necessary
-        while columns[col].len() < padded_num_rows {
-            columns[col].push(F::zero());
+
+        // 2. Padding
+        for _ in 0..padding {
+            columns[wire].push(F::zero());
         }
+
+        // 3. Private inputs
+        for row in num_pub_inputs..num_rows {
+            columns[wire].push(flat_witness[wire * num_rows + row].clone());
+        }
+
+        // 4. Padding to the next power of two
+        while columns[wire].len() < padded_num_rows {
+            columns[wire].push(F::zero());
+        }
+        // Sanity check
+        assert_eq!(columns[wire].len(), padded_num_rows);
     }
 
     columns
+}
+
+
+pub fn flatten_witness_matrix_preserve_padding<F: Clone>(
+    columns: &[Vec<F>],
+) -> Vec<F> {
+    let num_columns = columns.len();
+    let padded_num_rows = columns
+        .first()
+        .map(|col| col.len())
+        .expect("Empty columns vector");
+
+    // Sanity check: all columns should have the same length
+    for col in columns {
+        assert_eq!(col.len(), padded_num_rows, "Column length mismatch");
+    }
+
+    let mut flat = Vec::with_capacity(num_columns * padded_num_rows);
+
+    for col in columns {
+        for row in col {
+            flat.push(row.clone());
+        }
+    }
+
+    flat
 }
 
 fn main() {
@@ -106,24 +270,6 @@ fn main() {
     println!("R1CS num public inputs: {}", file.header.n_pub_in);
     println!("R1CS num private inputs: {}", file.header.n_prv_in);
     println!("R1CS witness len: {}", file.witness.len());
-    // let witnesses = file.witness.clone();
-
-    // indexes in witness of public values 1, 2, 4, 8, 44, 46, 85
-    // 0, 0, 10421825637439628824081370409036765017174374174061117515899412920044738899655,
-    // 0, 10612347151689404540561019678397472246525777872901669450210397933867489294116,
-    // 13586366247509677337685352076333204587518780062832582595806876819740439599275, 9702677999813389814729049215331589824309244590168229392617691640937402679279
-
-    // let (plonkish_circuit, plonkish_witness) = SimpleGeneralPlonkifier::<Fr>::plonkify(
-    //     &file,
-    //     &CustomizedGates::jellyfish_turbo_plonk_gate(),
-    // );
-    // return;
-
-    // let (plonkish_circuit, plonkish_witness) = LinearOnlyGeneralPlonkifier::<Fr>::plonkify(
-    //     &file,
-    //     &CustomizedGates::jellyfish_turbo_plonk_gate(),
-    // );
-    // // return;
 
     let start = Instant::now();
 
@@ -166,37 +312,25 @@ fn main() {
         let num_rows: usize = plonkish_circuit.params.num_constraints; //num_constraints
         let num_columns = plonkish_circuit.params.gate_func.num_witness_columns();
         let num_pub_inputs = plonkish_circuit.params.num_pub_input;
-        println!("num_columns: {}", num_columns);
-        println!("num_rows: {}", num_rows);
-        println!("num_pub_inputs: {}", num_pub_inputs);
 
         let witnesses: Vec<hyperplonk::witness::WitnessColumn<_>> =
-            split_flat_witness(&plonkish_witness, num_columns, num_rows)
+            split_flat_witness(&plonkish_witness, num_columns, num_rows, num_pub_inputs)
                 .into_iter()
                 .map(hyperplonk::witness::WitnessColumn::new)
                 .collect();
 
-        println!("Witness length: {}", witnesses[0].coeff_ref().len());
+        let witnesses_vec: Vec<Vec<_>> = witnesses
+                .iter()
+                .map(|w| w.coeff_ref().to_vec())  // Convert each slice into an owned Vec
+                .collect();
+            
+        let witnesses_flattened = flatten_witness_matrix_preserve_padding(&witnesses_vec);
+
 
         use ark_std::log2;
 
-        let chunk_size = 1 << log2(plonkish_circuit.params.num_constraints) as usize;
-        let expected_length = chunk_size * num_columns;
-        let mut permutation = plonkish_circuit.permutation.clone();
-
         use ark_std::Zero;
 
-        // Pad with zeros if the vector is too short
-        if permutation.len() < expected_length {
-            println!("permutation too short");
-            permutation.resize(expected_length, Fr::zero());
-        }
-
-        // Truncate if the vector is too long
-        if permutation.len() > expected_length {
-            println!("permutation too long");
-            permutation.truncate(expected_length);
-        }
 
         let selectors = plonkish_circuit.selectors.clone();
 
@@ -204,14 +338,79 @@ fn main() {
             plonkish_circuit.params.num_constraints.next_power_of_two();
         plonkish_circuit.params.num_pub_input = plonkish_circuit.params.num_pub_input.next_power_of_two();
 
+        let padding = num_pub_inputs.next_power_of_two() - num_pub_inputs;
+
         
-        // fork hyperplonk, then export hyperplonk index, do the proper conversions
+        let num_priv_inputs = num_rows - num_pub_inputs;
+        let pub_padding = num_pub_inputs.next_power_of_two() - num_pub_inputs;
+        let total_len = num_pub_inputs + pub_padding + num_priv_inputs;
+
+        let mut padded_selectors: Vec<Vec<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>>> = vec![vec![Fr::zero(); total_len]; selectors.len()];
+
+        for (i, sel_column) in selectors.iter().enumerate() {
+            // Copy public inputs
+            for j in 0..num_pub_inputs {
+                padded_selectors[i][j] = sel_column.0[j].clone();
+            }
+            // Padding remains zero (implicitly)
+
+            // Copy private inputs after padding
+            for j in 0..num_priv_inputs {
+                padded_selectors[i][num_pub_inputs + pub_padding + j] =
+                    sel_column.0[num_pub_inputs + j].clone();
+            }
+        }
+        
+
+        let padded_selectors: Vec<plonkify::selectors::SelectorColumn<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>>> = padded_selectors
+                .into_iter()
+                .map(|col| plonkify::selectors::SelectorColumn(col))
+                .collect()
+        ;
+ 
+        let new_num_rows = num_rows + padding;
+        let padded_num_rows = num_rows.next_power_of_two();
+        let pad = padded_num_rows - num_rows;
+
+        let chunk_size = 1 << log2(plonkish_circuit.params.num_constraints) as usize;
+        assert_eq!(chunk_size, padded_num_rows);
+        let expected_length = chunk_size * num_columns;
+        let mut permutation = plonkish_circuit.permutation.clone();
+
+
+        let mut new_permutation = pad_permutation_field(
+            permutation.clone(),
+            num_rows,
+            padding,
+            expected_length,
+        );
+    
+
+        assert_eq!(plonkish_circuit.params.num_constraints , witnesses[0].coeff_ref().len());
+        
+        
+        assert!(
+            check_permutation(&plonkish_witness, &permutation, num_rows),
+            "Permutation check failed"
+        );
+        assert!(
+            check_permutation(&witnesses_flattened, &new_permutation, num_rows.next_power_of_two()),
+            "Permutation check failed"
+        );
+
+
         let circuit: HyperPlonkIndex<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>> =
             HyperPlonkIndex {
-                params: convert_params(plonkish_circuit.params),
-                permutation: permutation,
-                selectors: convert_selectors(selectors),
+                params: convert_params(plonkish_circuit.params.clone()),
+                permutation: new_permutation,
+                selectors: convert_selectors(padded_selectors),
             };
+        assert_eq!(plonkish_circuit.params.num_constraints , circuit.selectors[0].0.len());
+
+        println!("Num gates: {}", num_columns);
+        println!("Num constraints (after padding): {}", circuit.params.num_constraints);
+        println!("Num public inputs (after padding): {}", circuit.params.num_pub_input);
+
         use ark_bn254::Bn254;
         use ark_bn254::Fr;
         use ark_ff::PrimeField;
@@ -239,55 +438,13 @@ fn main() {
             srs
         };
         use ark_ff::BigInt;
-        // public inputs are the first elements of the witness (consistent with original `file.witness` file)
-        let mut public_inputs: Vec<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>> = plonkish_witness[0..num_pub_inputs.next_power_of_two()].to_vec();
         
+        let mut public_inputs = plonkish_witness[..num_pub_inputs].to_vec();
+        public_inputs.resize(num_pub_inputs.next_power_of_two(), Fr::zero());
         
-        /*public_inputs[8] = Fr::zero(); // padding
-        public_inputs[9] = Fr::zero(); // additional padding
-        public_inputs[10] = Fr::zero(); // additional padding
-        public_inputs[11] = Fr::zero(); // additional padding
-        public_inputs[12] = Fr::zero(); // additional padding
-        public_inputs[13] = Fr::zero(); // additional padding
-        public_inputs[14] = Fr::zero(); // additional padding
-        public_inputs[15] = Fr::zero(); // additional padding*/
-        /*let public_inputs: [Fr; 8] = [
-            Fr::from_str("1").expect("failed to parse"), // but from my understanding should be 0
-            Fr::from_str("1").expect("failed to parse"), // 0?
-            Fr::from(BigInt([0, 0, 0, 0])), // 10421825637439628824081370409036765017174374174061117515899412920044738899655?
-            Fr::from(BigInt([0, 0, 0, 0])), // 0?
-            Fr::from(BigInt([
-                2540811791615192775,
-                2915835453654324972,
-                12845048901031846702,
-                1660292612223788596,
-            ])), // 10612347151689404540561019678397472246525777872901669450210397933867489294116?
-            Fr::from(BigInt([0, 0, 0, 0])), //13586366247509677337685352076333204587518780062832582595806876819740439599275
-            Fr::from(BigInt([
-                1318003681124415268,
-                8744354528158778391,
-                5232689545760966842,
-                1690644440548590990,
-            ])), // 9702677999813389814729049215331589824309244590168229392617691640937402679279?
-            Fr::from(BigInt([
-                7510843847969855659,
-                16363481456411911964,
-                12760593984962864632,
-                2164433017059063600,
-            ])), // 0? not sure about this one (if padding is sufficient)
-        ];*/
-        /*let public_inputs: [Fr; 8] = [ Fr::from_str("1").expect("failed to parse")
-            ,Fr::from_str("1").expect("failed to parse")
-            ,Fr::from_str("2").expect("failed to parse")
-            ,Fr::from_str("0").expect("failed to parse")
-            ,Fr::from_str("0").expect("failed to parse")
-            ,Fr::from_str("10421825637439628824081370409036765017174374174061117515899412920044738899655").expect("failed to parse")
-            ,Fr::from_str("0").expect("failed to parse")
-            ,Fr::from_str("8023826988587820048753786605810509994001809714865350663478428767669975931351").expect("failed to parse")
-        ];*/
+       
 
         let start = Instant::now();
-        println!("params.num_pub_input: {}", circuit.params.num_pub_input);
 
         let (pk, vk) =
             <PolyIOP<Fr> as HyperPlonkSNARK<Bn254, MultilinearKzgPCS<Bn254>>>::preprocess(
@@ -297,8 +454,6 @@ fn main() {
 
         println!("key extraction: {:?}", start.elapsed());
 
-        println!("public inputs: {:?}", public_inputs);
-        println!("public inputs len: {:?}", public_inputs.len());
 
         //==========================================================
         // generate a proof
@@ -322,6 +477,7 @@ fn main() {
         //==========================================================
         // verify a proof
         let start = Instant::now();
+        //println!("proof : {:?}", proof.perm_check_proof.zero_check_proof);
 
         let verify = <PolyIOP<Fr> as HyperPlonkSNARK<Bn254, MultilinearKzgPCS<Bn254>>>::verify(
             &vk,
@@ -335,5 +491,5 @@ fn main() {
     }
 
     let end = Instant::now();
-    println!("Time: {}", (end - start).as_micros());
+    //println!("Time: {}", (end - start).as_micros());
 }
