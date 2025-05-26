@@ -162,14 +162,21 @@ fn main() {
 
         assert!(plonkish_circuit.is_satisfied(&plonkish_witness));
 
+
         let num_rows: usize = plonkish_circuit.params.num_constraints; //num_constraints
         let num_columns = plonkish_circuit.params.gate_func.num_witness_columns();
+        let num_pub_inputs = plonkish_circuit.params.num_pub_input;
+        println!("num_columns: {}", num_columns);
+        println!("num_rows: {}", num_rows);
+        println!("num_pub_inputs: {}", num_pub_inputs);
 
         let witnesses: Vec<hyperplonk::witness::WitnessColumn<_>> =
             split_flat_witness(&plonkish_witness, num_columns, num_rows)
                 .into_iter()
                 .map(hyperplonk::witness::WitnessColumn::new)
                 .collect();
+
+        println!("Witness length: {}", witnesses[0].coeff_ref().len());
 
         use ark_std::log2;
 
@@ -195,6 +202,9 @@ fn main() {
 
         plonkish_circuit.params.num_constraints =
             plonkish_circuit.params.num_constraints.next_power_of_two();
+        plonkish_circuit.params.num_pub_input = plonkish_circuit.params.num_pub_input.next_power_of_two();
+
+        
         // fork hyperplonk, then export hyperplonk index, do the proper conversions
         let circuit: HyperPlonkIndex<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>> =
             HyperPlonkIndex {
@@ -229,7 +239,19 @@ fn main() {
             srs
         };
         use ark_ff::BigInt;
-        let public_inputs: [Fr; 8] = [
+        // public inputs are the first elements of the witness (consistent with original `file.witness` file)
+        let mut public_inputs: Vec<ark_ff::Fp<ark_ff::MontBackend<ark_bn254::FrConfig, 4>, 4>> = plonkish_witness[0..num_pub_inputs.next_power_of_two()].to_vec();
+        
+        
+        /*public_inputs[8] = Fr::zero(); // padding
+        public_inputs[9] = Fr::zero(); // additional padding
+        public_inputs[10] = Fr::zero(); // additional padding
+        public_inputs[11] = Fr::zero(); // additional padding
+        public_inputs[12] = Fr::zero(); // additional padding
+        public_inputs[13] = Fr::zero(); // additional padding
+        public_inputs[14] = Fr::zero(); // additional padding
+        public_inputs[15] = Fr::zero(); // additional padding*/
+        /*let public_inputs: [Fr; 8] = [
             Fr::from_str("1").expect("failed to parse"), // but from my understanding should be 0
             Fr::from_str("1").expect("failed to parse"), // 0?
             Fr::from(BigInt([0, 0, 0, 0])), // 10421825637439628824081370409036765017174374174061117515899412920044738899655?
@@ -253,9 +275,19 @@ fn main() {
                 12760593984962864632,
                 2164433017059063600,
             ])), // 0? not sure about this one (if padding is sufficient)
-        ];
+        ];*/
+        /*let public_inputs: [Fr; 8] = [ Fr::from_str("1").expect("failed to parse")
+            ,Fr::from_str("1").expect("failed to parse")
+            ,Fr::from_str("2").expect("failed to parse")
+            ,Fr::from_str("0").expect("failed to parse")
+            ,Fr::from_str("0").expect("failed to parse")
+            ,Fr::from_str("10421825637439628824081370409036765017174374174061117515899412920044738899655").expect("failed to parse")
+            ,Fr::from_str("0").expect("failed to parse")
+            ,Fr::from_str("8023826988587820048753786605810509994001809714865350663478428767669975931351").expect("failed to parse")
+        ];*/
 
         let start = Instant::now();
+        println!("params.num_pub_input: {}", circuit.params.num_pub_input);
 
         let (pk, vk) =
             <PolyIOP<Fr> as HyperPlonkSNARK<Bn254, MultilinearKzgPCS<Bn254>>>::preprocess(
